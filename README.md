@@ -1,7 +1,7 @@
 # VoxelGridOMP
 
 Voxel grid in parallel, using the OpenMP standard, based on PCL.
-Tested on PCL-1.7, 1.81 1.10.
+Tested on PCL-1.7, 1.8, 1.10.
 
 In our experiment, 2,500,000 points cost 68 ms with 10 threads compared to 217 ms for PCL voxelgrid.
 
