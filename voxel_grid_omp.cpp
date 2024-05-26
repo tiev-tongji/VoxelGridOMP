@@ -2,9 +2,85 @@
 // Created by hk on 3/26/23.
 //
 #include "voxel_grid_omp.h"
-
+#include "Eigen/src/Core/Matrix.h"
+#include "pcl/impl/point_types.hpp"
+#include <algorithm>
+#include <boost/sort/spreadsort/integer_sort.hpp>
+#include <cstddef>
+#include <cstring>
+#include <limits>
 #include <pcl/filters/impl/voxel_grid.hpp>
 #include <omp.h>
+
+namespace{
+/*
+等同于cloud_point_index_idx
+cloud_point_index_idx没有默认构造函数，会导致boost的integer_sort编译不通过
+*/
+struct VoxelIndex{
+    unsigned int idx;
+    unsigned int cloud_point_index;
+
+    VoxelIndex() = default;
+    VoxelIndex (unsigned int idx_, unsigned int cloud_point_index_) : idx (idx_), cloud_point_index (cloud_point_index_) {}
+    bool operator < (const VoxelIndex &p) const { return (idx < p.idx); }
+};
+const int kSampleStep = 100;
+/*
+为每个线程分配它所处理的voxel index的上下界.
+输入:
+- index_all_thread.size()个有序vector，表示之前各个线程产生的voxel索引
+- 需要为thread_num个线程分配任务
+输出: 每个线程的任务
+*/
+size_t AssignTask(const std::vector<std::shared_ptr<std::vector<int>>>& index_all_thread, int thread_num, std::vector<std::vector<std::pair<int, int>>>* tasks){
+    // 采样
+    std::vector<int> sampled_data;
+    size_t total = 0;
+    for(auto& index: index_all_thread){
+        total += index->size();
+    }
+    sampled_data.reserve(total/kSampleStep+index_all_thread.size()*2);
+    for(auto& index: index_all_thread){
+        size_t i=0;
+        for(; i<index->size(); i+=kSampleStep){
+            sampled_data.push_back((*index)[i]);
+        }
+        if(index->size()>0 && (index->size()-1)%kSampleStep>kSampleStep/2){
+            sampled_data.push_back(index->back());
+        }
+    }
+    // 确定每个进程分配voxel索引的上下界
+    std::sort(sampled_data.begin(), sampled_data.end());
+    tasks->resize(thread_num);
+    int pad_size = sampled_data.size()%thread_num;
+    int pivot_step = sampled_data.size()/thread_num;
+    for(int i=0; i<thread_num; ++i){
+        int start = pivot_step*i;
+        start += (i>pad_size?pad_size:i);
+        int pivot_start = sampled_data[start];
+        int pivot_end;
+        if(i+1<thread_num){
+            int end = pivot_step*(i+1);
+            end += (i+1>pad_size?pad_size:i+1);
+            pivot_end = sampled_data[end];
+        }
+        auto& cur_task = (*tasks)[i];
+        cur_task.resize(index_all_thread.size());
+        for(size_t j=0; j<cur_task.size(); ++j){
+            auto start_it = std::lower_bound(index_all_thread[j]->begin(), index_all_thread[j]->end(),pivot_start);
+            cur_task[j].first = int(start_it - index_all_thread[j]->begin());
+            if(i+1>=thread_num){
+                cur_task[j].second = index_all_thread[j]->size();
+            }else{
+                auto end_it = std::lower_bound(index_all_thread[j]->begin(), index_all_thread[j]->end(),pivot_end);
+                cur_task[j].second = int(end_it-index_all_thread[j]->begin());
+            }
+        }
+    }
+    return total;
+}
+}
 
 void
 pcl::VoxelGridOMP::setNumberOfThreads (unsigned int nr_threads)
@@ -100,13 +176,15 @@ pcl::VoxelGridOMP::applyFilter(PointCloud &output)
     for (size_t i = 0; i < threads_; ++i) {
         cloud_all_threads[i].reset(new PointCloud ());
     }
-
+    std::vector<std::shared_ptr<std::vector<int>>> index_all_threads(threads_);
+    std::vector<std::shared_ptr<std::vector<double>>> weight_all_threads(threads_);
+    std::vector<std::shared_ptr<std::vector<Eigen::VectorXf, Eigen::aligned_allocator<Eigen::VectorXf>>>> centroid_all_threads(threads_);
 #pragma omp parallel num_threads(threads_)
     {
         int thread_id = omp_get_thread_num();
         PointCloudPtr& cloud_thread = cloud_all_threads[thread_id];
 //        PointCloud cloud_thread;
-        std::vector<cloud_point_index_idx> index_vector; // voxel index, pointer of point
+        std::vector<VoxelIndex> index_vector; // voxel index, pointer of point
         index_vector.reserve(indices_->size() / threads_);
 
         int num_points = 0;
@@ -157,7 +235,7 @@ pcl::VoxelGridOMP::applyFilter(PointCloud &output)
 
                 // Compute the centroid leaf index
                 int idx = ijk0 * divb_mul_[0] + ijk1 * divb_mul_[1] + ijk2 * divb_mul_[2];
-                index_vector.push_back(cloud_point_index_idx(static_cast<unsigned int> (idx), *it));
+                index_vector.push_back(VoxelIndex(static_cast<unsigned int> (idx), *it));
             }
         }
             // No distance filtering, process all data
@@ -166,8 +244,7 @@ pcl::VoxelGridOMP::applyFilter(PointCloud &output)
             // with calculated idx. Points with the same idx value will contribute to the
             // same point of resulting CloudPoint
 
-#pragma omp for
-//            for (std::vector<int>::const_iterator it = indices_->begin(); it != indices_->end(); ++it) {
+#pragma omp for schedule(dynamic,1024)
             for (size_t i = 0; i < indices_->size(); ++i) {
                 const int &point_id = indices_->at(i);
                 const PointT &point = input_->points[point_id];
@@ -189,7 +266,7 @@ pcl::VoxelGridOMP::applyFilter(PointCloud &output)
                 int idx = ijk0 * divb_mul_[0] + ijk1 * divb_mul_[1] + ijk2 * divb_mul_[2]; // voxel id the point located
                 /// !!! so slow  !!!
                 index_vector.emplace_back(
-                        cloud_point_index_idx(static_cast<unsigned int> (idx), point_id));
+                        VoxelIndex(static_cast<unsigned int> (idx), point_id));
             }
         }
 //        printf("thread %d points to voxel cost: %fms\n", thread_id, t_p2v.toc());
@@ -198,7 +275,9 @@ pcl::VoxelGridOMP::applyFilter(PointCloud &output)
 //        TicToc t_sort;
         // Second pass: sort the index_vector vector using value representing target cell as index
         // in effect all points belonging to the same output cell will be next to each other
-        std::sort(index_vector.begin(), index_vector.end(), std::less<cloud_point_index_idx>());
+        auto rightshift_func = [](const VoxelIndex &x, const unsigned offset) { return x.idx >> offset; };
+        boost::sort::spreadsort::integer_sort(index_vector.begin(), index_vector.end(), rightshift_func);
+        // std::sort(index_vector.begin(), index_vector.end(), std::less<cloud_point_index_idx>());
 //        printf("thread %d sort cost: %fms\n", thread_id, t_sort.toc());
 
 //    TicToc t_valid_voxel;
@@ -230,12 +309,14 @@ pcl::VoxelGridOMP::applyFilter(PointCloud &output)
         //    TicToc t_layout;
         // Fourth pass: compute centroids, insert them into their final position
 //        cloud_thread.points.resize(total);
-        cloud_thread->points.resize(total);
-        Eigen::VectorXf centroid = Eigen::VectorXf::Zero (centroid_size);
-        Eigen::VectorXf temporary = Eigen::VectorXf::Zero (centroid_size);
-
+        size_t cur_size = first_and_last_indices_vector.size();
+        auto indexes_one_thread = std::make_shared<std::vector<int>>(cur_size);
+        auto weight_one_thread = std::make_shared<std::vector<double>>(cur_size);
+        auto centroid_one_thread = std::make_shared<std::vector<Eigen::VectorXf, Eigen::aligned_allocator<Eigen::VectorXf>>>(cur_size);
         for (unsigned int cp = 0; cp < first_and_last_indices_vector.size(); ++cp)
         {
+            Eigen::VectorXf centroid = Eigen::VectorXf::Zero (centroid_size);
+            Eigen::VectorXf temporary = Eigen::VectorXf::Zero (centroid_size);
             // calculate centroid - sum values from all input points, that have the same idx value in index_vector array
             unsigned int first_index = first_and_last_indices_vector[cp].first;
             unsigned int last_index = first_and_last_indices_vector[cp].second;
@@ -292,17 +373,61 @@ pcl::VoxelGridOMP::applyFilter(PointCloud &output)
             if (save_leaf_layout_)
                 leaf_layout_[index_vector[first_index].idx] = cp;
 
-            centroid /= static_cast<float> (last_index - first_index);
+            (*centroid_one_thread)[cp] = centroid;
+            (*weight_one_thread)[cp] = last_index-first_index;
+            (*indexes_one_thread)[cp] = index_vector[first_index].idx;
+        }
+#pragma omp critical
+        {
+            centroid_all_threads[thread_id] = centroid_one_thread;
+            weight_all_threads[thread_id] = weight_one_thread;
+            index_all_threads[thread_id] = indexes_one_thread;
+        }
+//        printf("thread %d compute %d centroids cost: %fms\n", thread_id, (int)cloud_thread->points.size(), t_centriod.toc());
+    }
 
-            // store centroid
-            // Do we need to process all the fields?
-            if (!downsample_all_data_) {
-                cloud_thread->points[cp].x = centroid[0];
-                cloud_thread->points[cp].y = centroid[1];
-                cloud_thread->points[cp].z = centroid[2];
-            } else {
+    //merge cloud from all threads
+    std::vector<std::vector<std::pair<int, int>>> tasks;
+    size_t total = AssignTask(index_all_threads, threads_, &tasks);
+    std::vector<PointCloudPtr> final_clouds(threads_);
+#pragma omp parallel num_threads(threads_)
+    {
+        int thread_id = omp_get_thread_num();
+        auto& task = tasks[thread_id];
+        std::vector<int> cur(task.size());
+        for(size_t i=0; i<cur.size(); ++i){
+            cur[i]=task[i].first;
+        }
+        PointCloudPtr cloud(new PointCloud());
+        cloud->reserve(total/threads_);
+        while(true){
+            bool finished = true;
+            int min_voxel_index = std::numeric_limits<int>::max();
+            for(size_t i=0; i<task.size(); ++i){
+                if(cur[i]<task[i].second){
+                    min_voxel_index = std::min(min_voxel_index, (*(index_all_threads[i]))[cur[i]]);
+                    finished=false;
+                }
+            }
+            if(finished) break;
+            Eigen::VectorXf centroid = Eigen::VectorXf::Zero (centroid_size);
+            int weight = 0;
+            for(size_t i=0; i<task.size(); ++i){
+                if(cur[i]<task[i].second && (*(index_all_threads[i]))[cur[i]]==min_voxel_index){
+                    centroid += (*(centroid_all_threads[i]))[cur[i]];
+                    weight += (*(weight_all_threads[i]))[cur[i]];
+                    ++cur[i];
+                }
+            }
+            centroid /= float(weight);
+            cloud->push_back(PointT());
+            if (!downsample_all_data_){
+                cloud->back().x = centroid[0];
+                cloud->back().y = centroid[1];
+                cloud->back().z = centroid[2];
+            }else{
                 //  NdCopyEigenPointFunctor( p1 the input Eigen type, p2 the output Point type)
-                pcl::for_each_type<FieldList>(pcl::NdCopyEigenPointFunctor<PointT>(centroid, cloud_thread->points[cp]));
+                pcl::for_each_type<FieldList>(pcl::NdCopyEigenPointFunctor<PointT>(centroid, cloud->back()));
                 // ---[ RGB special case
                 if (rgba_index >= 0) {
                     // pack r/g/b into rgb
@@ -310,33 +435,28 @@ pcl::VoxelGridOMP::applyFilter(PointCloud &output)
                                                                                                          1];
                     int rgb = (static_cast<int> (r) << 16) | (static_cast<int> (g) << 8) | static_cast<int> (b);
 //                memcpy (reinterpret_cast<char*> (&output.points[index]) + rgba_index, &rgb, sizeof (float));
-                    memcpy(reinterpret_cast<char *> (&cloud_thread->points[cp]) + rgba_index, &rgb, sizeof(float));
+                    memcpy(reinterpret_cast<char *> (&(cloud->back())) + rgba_index, &rgb, sizeof(float));
                 }
             }
         }
-//        printf("thread %d compute %d centroids cost: %fms\n", thread_id, (int)cloud_thread->points.size(), t_centriod.toc());
+#pragma omp critical
+        {
+            final_clouds[thread_id] = cloud;
+        }
     }
-
-    //merge cloud from all threads
-    TicToc t_col;
-    for (size_t i = 1; i < threads_; ++i) {
-        *cloud_all_threads[0] += *cloud_all_threads[i];
+    size_t final_num = 0;
+    for(auto& cloud: final_clouds){
+        final_num += cloud->size();
     }
-//    printf("collect cloud %d from all thread cost: %fms\n", (int)cloud_all_threads[0]->size(), t_col.toc());
-
-    if (final_filter) {
-        // Create the filtering object
-        pcl::VoxelGrid<PointT> sor;
-        sor.setInputCloud(cloud_all_threads[0]);
-        sor.setLeafSize(leaf_size_);
-
-        TicToc t_vg;
-        sor.filter(output);
-        if (console_print)
-            printf("final voxel grid PCL cost: %fms\n", t_vg.toc());
+    output.resize(final_num);
+    char* dst= reinterpret_cast<char*>(&output[0]);
+    size_t offset = 0;
+    for(auto& cloud: final_clouds){
+        size_t copy_size = cloud->size()*sizeof(PointT);
+        char* src = reinterpret_cast<char*>(&((cloud->points)[0]));
+        std::memcpy(dst+offset, src, copy_size);
+        offset+=copy_size;
     }
-    else
-        pcl::copyPointCloud(*cloud_all_threads[0], output);
 }
 
 void pcl::VoxelGridOMP::getMinMax3DOMP(const pcl::PointCloud<PointT> &cloud, const std::vector<int> &indices,
@@ -358,7 +478,8 @@ void pcl::VoxelGridOMP::getMinMax3DOMP(const pcl::PointCloud<PointT> &cloud, con
             voxel_min_t.setConstant(FLT_MAX);
             voxel_max_t.setConstant(-FLT_MAX);
 
-            #pragma omp for
+            // #pragma omp for
+            #pragma omp for schedule(dynamic,1024)
             for (size_t i = 0; i < indices.size(); i++) {
                 pcl::Array4fMapConst pt = cloud.points[indices[i]].getArray4fMap();
                 voxel_min_t = voxel_min_t.array().min(pt);
@@ -379,7 +500,8 @@ void pcl::VoxelGridOMP::getMinMax3DOMP(const pcl::PointCloud<PointT> &cloud, con
             voxel_min_t.setConstant(FLT_MAX); // thread private
             voxel_max_t.setConstant(-FLT_MAX);
 //            #pragma omp single
-            #pragma omp for
+            // #pragma omp for
+            #pragma omp for schedule(dynamic,1024)
             for (size_t i = 0; i < indices.size(); i++) {
                 // Check if the point is invalid
                 if (!pcl_isfinite (cloud.points[indices[i]].x) ||
