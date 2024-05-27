@@ -1,6 +1,9 @@
 cmake_minimum_required(VERSION 3.20)
 project(pcl_test)
 
+set(CMAKE_BUILD_TYPE "Release")
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -Wall -g -pthread")
+
 set(CMAKE_CXX_STANDARD 11)
 
 find_package(PCL REQUIRED)
